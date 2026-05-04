@@ -1,0 +1,437 @@
+-- Load Orion UI Library
+local OrionLib = loadstring(game:HttpGet("https://raw.githubusercontent.com/Qanuir/orion-ui/refs/heads/main/source.lua"))()
+
+-- Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local camera = Workspace.CurrentCamera
+
+-- ── Window ──────────────────────────
+local Window = OrionLib:MakeWindow({
+    Name = "Dropped Items Helper",
+    HidePremium = false,
+    SaveConfig = false,
+    ConfigFolder = "DroppedItemsHelper"
+})
+
+-- ── State ──────────────────────────
+local TELEPORT_HEIGHT = 2.5
+local processedItems = {}
+
+local autoCollectEnabled   = false
+local teleportEnabled      = false
+local respawnAfterCollect  = false
+local espEnabled           = false
+local showItemName         = false
+local espOutlineColor      = Color3.fromRGB(255,255,255)
+local espTextColor         = Color3.new(1,1,1)
+
+-- Tracked items & counters
+local trackedItems = {"Gilded Coin", "Lucky Potion", "Speed Potion", "Coin"}
+local collectedCounts = {}
+for _, name in ipairs(trackedItems) do
+    collectedCounts[name] = 0
+end
+
+-- Orion label references (table name -> label object)
+local counterLabels = {}
+
+-- ── Utilities ──────────────────────
+local function getPrompt(object)
+    local prompt = object:FindFirstChildOfClass("ProximityPrompt")
+    if prompt then return prompt end
+    local casing = object:FindFirstChild("Casing")
+    if casing then
+        prompt = casing:FindFirstChildOfClass("ProximityPrompt")
+    end
+    return prompt
+end
+
+local function getPromptPart(prompt)
+    local parent = prompt.Parent
+    while parent do
+        if parent:IsA("BasePart") then return parent end
+        parent = parent.Parent
+    end
+    return nil
+end
+
+local function getPrimaryPart(item)
+    if item:IsA("BasePart") then return item end
+    if item:IsA("Model") then
+        return item.PrimaryPart or item:FindFirstChildWhichIsA("BasePart")
+    end
+    return item:FindFirstChildWhichIsA("BasePart")
+end
+
+local function toColor3(val)
+    if typeof(val) == "Color3" then return val end
+    if type(val) == "table" then
+        return val.Color or Color3.new(1,1,1)
+    end
+    return Color3.new(1,1,1)
+end
+
+-- ── Counter update ─────────────────
+local function updateCounter(name)
+    local lbl = counterLabels[name]
+    if lbl then
+        lbl:Set(name .. ": " .. collectedCounts[name])
+    end
+end
+
+-- ── Auto Collect + Teleport ────────
+local function collectItem(item)
+    if not autoCollectEnabled and not teleportEnabled then return false end
+    local prompt = getPrompt(item)
+    if not prompt or not prompt.Enabled then return false end
+
+    local promptPart = getPromptPart(prompt) or getPrimaryPart(item)
+    if not promptPart then return false end
+
+    local character = player.Character
+    if not character then return false end
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then return false end
+
+    local originalCFrame = rootPart.CFrame
+    local didTeleport = false
+
+    -- Teleport above item
+    if teleportEnabled then
+        local targetCFrame = promptPart.CFrame + Vector3.new(0, TELEPORT_HEIGHT, 0)
+        pcall(function() character:PivotTo(targetCFrame) end)
+        didTeleport = true
+        task.wait(0.25)
+    end
+
+    local collected = false
+    if autoCollectEnabled then
+        if not processedItems[item] then
+            local originalLOS = prompt.RequiresLineOfSight
+            prompt.RequiresLineOfSight = false
+
+            local triggered = false
+            local conn
+            pcall(function()
+                conn = prompt.Triggered:Connect(function()
+                    triggered = true
+                    if conn then conn:Disconnect() end
+                end)
+            end)
+            pcall(function() prompt:InputHoldBegin() end)
+
+            local start = tick()
+            while not triggered and tick() - start < 3 do
+                RunService.Heartbeat:Wait()
+            end
+
+            if triggered then
+                processedItems[item] = true
+                collected = true
+
+                -- Increment counter
+                local name = item.Name
+                if collectedCounts[name] ~= nil then
+                    collectedCounts[name] = collectedCounts[name] + 1
+                    updateCounter(name)
+                end
+
+                -- Respawn after collect
+                if respawnAfterCollect then
+                    task.wait(0.2)
+                    if player.Character then
+                        pcall(function() player:LoadCharacter() end)
+                    end
+                end
+            end
+
+            if conn then pcall(function() conn:Disconnect() end) end
+            prompt.RequiresLineOfSight = originalLOS
+        end
+    end
+
+    if didTeleport then
+        pcall(function() character:PivotTo(originalCFrame) end)
+    end
+
+    return collected
+end
+
+-- ── Detection ──────────────────────
+local DROPPED_ITEMS_FOLDER = Workspace:WaitForChild("DroppedItems")
+
+DROPPED_ITEMS_FOLDER.ChildAdded:Connect(function(child)
+    collectItem(child)
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        for _, child in ipairs(DROPPED_ITEMS_FOLDER:GetChildren()) do
+            if getPrompt(child) then
+                collectItem(child)
+            end
+        end
+    end
+end)
+
+player.CharacterAdded:Connect(function()
+    -- Keep memory of collected items
+end)
+
+-- ── ESP ────────────────────────────
+local useDrawing = pcall(function() local d = Drawing.new("Line"); d:Remove() end)
+local espObjects = {}
+
+local function createESP(item)
+    if useDrawing then
+        local lines = {}
+        for i = 1, 4 do
+            local line = Drawing.new("Line")
+            line.Visible = false
+            line.Color = espOutlineColor
+            line.Thickness = 2
+            table.insert(lines, line)
+        end
+        local text = Drawing.new("Text")
+        text.Visible = false
+        text.Color = espTextColor
+        text.Size = 18
+        text.Font = 2
+        text.Center = true
+        espObjects[item] = { lines = lines, text = text }
+    else
+        local adornee = getPrimaryPart(item) or item
+        if not adornee then return end
+        local gui = Instance.new("BillboardGui")
+        gui.Size = UDim2.new(4,0,4,0)
+        gui.AlwaysOnTop = true
+        gui.Adornee = adornee
+        gui.Parent = item
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1,0,1,0)
+        frame.BackgroundTransparency = 1
+        frame.BorderSizePixel = 0
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = espOutlineColor
+        stroke.Thickness = 2
+        stroke.Parent = frame
+        frame.Parent = gui
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1,0,0,30)
+        label.Position = UDim2.new(0,0,-0.2,0)
+        label.AnchorPoint = Vector2.new(0.5,1)
+        label.BackgroundTransparency = 1
+        label.TextColor3 = espTextColor
+        label.TextSize = 18
+        label.Text = item.Name
+        label.Visible = showItemName
+        label.Parent = gui
+        espObjects[item] = gui
+    end
+end
+
+local function removeESP(item)
+    local obj = espObjects[item]
+    if obj then
+        if useDrawing then
+            for _, l in ipairs(obj.lines) do l:Remove() end
+            obj.text:Remove()
+        else
+            obj:Destroy()
+        end
+        espObjects[item] = nil
+    end
+end
+
+local function updateESP()
+    for item, _ in pairs(espObjects) do
+        if not item:IsDescendantOf(DROPPED_ITEMS_FOLDER) then removeESP(item) end
+    end
+    if not espEnabled then
+        for _, obj in pairs(espObjects) do
+            if useDrawing then
+                for _, l in ipairs(obj.lines) do l.Visible = false end
+                obj.text.Visible = false
+            else
+                obj.Enabled = false
+            end
+        end
+        return
+    end
+    for _, item in ipairs(DROPPED_ITEMS_FOLDER:GetChildren()) do
+        if not espObjects[item] then createESP(item) end
+        local obj = espObjects[item]
+        if not obj then continue end
+
+        if useDrawing then
+            local prim = getPrimaryPart(item)
+            if not prim then
+                for _, l in ipairs(obj.lines) do l.Visible = false end
+                obj.text.Visible = false
+                continue
+            end
+            local cf, size = prim.CFrame, prim.Size
+            local corners = {
+                (cf * CFrame.new(-size.X/2, -size.Y/2, -size.Z/2)).Position,
+                (cf * CFrame.new( size.X/2, -size.Y/2, -size.Z/2)).Position,
+                (cf * CFrame.new( size.X/2,  size.Y/2, -size.Z/2)).Position,
+                (cf * CFrame.new(-size.X/2,  size.Y/2, -size.Z/2)).Position,
+                (cf * CFrame.new(-size.X/2, -size.Y/2,  size.Z/2)).Position,
+                (cf * CFrame.new( size.X/2, -size.Y/2,  size.Z/2)).Position,
+                (cf * CFrame.new( size.X/2,  size.Y/2,  size.Z/2)).Position,
+                (cf * CFrame.new(-size.X/2,  size.Y/2,  size.Z/2)).Position,
+            }
+            local screenPoints = {}
+            local anyBehind = false
+            for _, wp in ipairs(corners) do
+                local sp, onScreen = camera:WorldToViewportPoint(wp)
+                if not onScreen then anyBehind = true end
+                table.insert(screenPoints, Vector2.new(sp.X, sp.Y))
+            end
+            if anyBehind then
+                for _, l in ipairs(obj.lines) do l.Visible = false end
+                obj.text.Visible = false
+                continue
+            end
+            local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+            for _, sp in ipairs(screenPoints) do
+                if sp.X < minX then minX = sp.X end
+                if sp.Y < minY then minY = sp.Y end
+                if sp.X > maxX then maxX = sp.X end
+                if sp.Y > maxY then maxY = sp.Y end
+            end
+            obj.lines[1].From, obj.lines[1].To = Vector2.new(minX, minY), Vector2.new(maxX, minY)
+            obj.lines[2].From, obj.lines[2].To = Vector2.new(maxX, minY), Vector2.new(maxX, maxY)
+            obj.lines[3].From, obj.lines[3].To = Vector2.new(maxX, maxY), Vector2.new(minX, maxY)
+            obj.lines[4].From, obj.lines[4].To = Vector2.new(minX, maxY), Vector2.new(minX, minY)
+            for _, l in ipairs(obj.lines) do l.Visible = true end
+            obj.text.Position = Vector2.new((minX+maxX)/2, minY-20)
+            obj.text.Visible = showItemName
+            obj.text.Color = espTextColor
+            obj.text.Text = item.Name
+        else
+            obj.Enabled = true
+            local frame = obj:FindFirstChildOfClass("Frame")
+            if frame and frame:FindFirstChildOfClass("UIStroke") then
+                frame:FindFirstChildOfClass("UIStroke").Color = espOutlineColor
+            end
+            local label = obj:FindFirstChildOfClass("TextLabel")
+            if label then
+                label.Visible = showItemName
+                label.TextColor3 = espTextColor
+                label.Text = item.Name
+            end
+        end
+    end
+end
+
+DROPPED_ITEMS_FOLDER.ChildRemoved:Connect(function(child)
+    removeESP(child)
+end)
+
+-- ── UI Tabs ────────────────────────
+local AutoTab = Window:MakeTab({
+    Name = "Auto Collect",
+    Icon = "rbxassetid://7733967807"  -- gear icon
+})
+
+local CounterTab = Window:MakeTab({
+    Name = "Counter",
+    Icon = "rbxassetid://7733967807"
+})
+
+local ESPTab = Window:MakeTab({
+    Name = "ESP",
+    Icon = "rbxassetid://7733967807"
+})
+
+-- ── Auto Collect Section ───────────
+AutoTab:AddToggle({
+    Name = "Auto Collect",
+    Default = false,
+    Callback = function(Value)
+        autoCollectEnabled = Value
+    end
+})
+
+AutoTab:AddToggle({
+    Name = "Teleport",
+    Default = false,
+    Callback = function(Value)
+        teleportEnabled = Value
+    end
+})
+
+AutoTab:AddToggle({
+    Name = "Respawn After Collect",
+    Default = false,
+    Callback = function(Value)
+        respawnAfterCollect = Value
+    end
+})
+
+AutoTab:AddSlider({
+    Name = "Teleport Height",
+    Min = 1,
+    Max = 5,
+    Default = 2.5,
+    Color = Color3.fromRGB(255,255,255),
+    Increment = 0.1,
+    ValueName = "studs up",
+    Callback = function(Value)
+        TELEPORT_HEIGHT = Value
+    end
+})
+
+-- ── Counter Section ────────────────
+-- Use Orion's AddLabel to create live-updatable labels
+for _, name in ipairs(trackedItems) do
+    local lbl = CounterTab:AddLabel(name .. ": 0")
+    counterLabels[name] = lbl
+end
+
+-- ── ESP Section ────────────────────
+ESPTab:AddToggle({
+    Name = "Enabled",
+    Default = false,
+    Callback = function(Value)
+        espEnabled = Value
+    end
+})
+
+ESPTab:AddColorpicker({
+    Name = "Outline Color",
+    Default = Color3.fromRGB(255,255,255),
+    Callback = function(Value)
+        espOutlineColor = toColor3(Value)
+    end
+})
+
+ESPTab:AddToggle({
+    Name = "Show Item Name",
+    Default = false,
+    Callback = function(Value)
+        showItemName = Value
+    end
+})
+
+ESPTab:AddColorpicker({
+    Name = "Name Color",
+    Default = Color3.new(1,1,1),
+    Callback = function(Value)
+        espTextColor = toColor3(Value)
+    end
+})
+
+-- ── Finalize ──────────────────────
+OrionLib:Init()
+
+-- ESP render loop
+RunService.RenderStepped:Connect(updateESP)
+
+print("✅ Orion UI version ready – counters update instantly.")
